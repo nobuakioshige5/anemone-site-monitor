@@ -1,0 +1,36 @@
+name: site-monitor
+
+on:
+  schedule:
+    - cron: "7 * * * *"  # 毎時07分
+  workflow_dispatch:
+
+concurrency:
+  group: site-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # 前回の異常状態を引き継ぐ(新規検知・復旧・6時間ごとの再通知の判定用)
+      - uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: site-monitor-state-${{ github.run_id }}
+          restore-keys: site-monitor-state-
+      - run: python check_sites.py
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state
+          key: site-monitor-state-${{ github.run_id }}
