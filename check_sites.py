@@ -141,7 +141,8 @@ def post_slack(text, dry_run):
     if dry_run:
         print("----- Slack (dry-run) -----\n" + text)
         return
-    webhook = os.environ.get("SLACK_WEBHOOK_URL")
+    # PowerShell 経由で Secret を登録すると先頭に BOM が付き、requests が URL と認識できなくなる
+    webhook = os.environ.get("SLACK_WEBHOOK_URL", "").strip().lstrip("﻿")
     if not webhook:
         sys.exit("SLACK_WEBHOOK_URL が未設定")
     r = requests.post(webhook, json={"text": text}, timeout=TIMEOUT)
@@ -159,12 +160,8 @@ def fmt_failures(items):
     return "\n".join(lines)
 
 
-def main():
-    sys.stdout.reconfigure(encoding="utf-8")
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
-
+def run_once(dry_run):
+    """1回分のチェックと通知。Slack 送信に失敗したら False を返す。"""
     now = datetime.now(JST)
     urls, sitemap_errors = collect_urls()
     jobs = [(u, p) for u in urls for p in PROFILES]
@@ -196,7 +193,11 @@ def main():
     if msgs:
         if new or remind_due:
             msgs.append("キャッシュが原因なら、WP Rocket「キャッシュをクリア」で直ることが多いです。")
-        post_slack("\n\n".join(msgs), args.dry_run)
+        try:
+            post_slack("\n\n".join(msgs), dry_run)
+        except Exception as e:  # 送れなかった異常は次回「新規」として再送されるよう状態を更新しない
+            print(f"Slack送信失敗: {type(e).__name__}: {e}")
+            return False
         if new or remind_due:
             state["last_notified"] = now.isoformat()
     if not failing_now:
@@ -205,6 +206,30 @@ def main():
     state["last_run"] = now.isoformat()
     state["checked"] = len(jobs)
     save_state(state)
+    return True
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    # GitHub の定期実行は数時間に1回まで間引かれることがあるため、1回の実行の中で
+    # interval 分ごとにチェックを繰り返し、合計 loop 分で終える(0なら1回だけ)
+    ap.add_argument("--loop-minutes", type=float, default=0)
+    ap.add_argument("--interval-minutes", type=float, default=60)
+    args = ap.parse_args()
+
+    started = time.monotonic()
+    ok = True
+    while True:
+        t0 = time.monotonic()
+        ok = run_once(args.dry_run) and ok
+        next_at = t0 + args.interval_minutes * 60
+        if next_at + 10 * 60 > started + args.loop_minutes * 60:  # 次の1回を終える余裕がなければ終了
+            break
+        time.sleep(max(0, next_at - time.monotonic()))
+    if not ok:
+        sys.exit("Slack送信に失敗した回があります(GitHubの失敗メールが代わりの通知になります)")
 
 
 if __name__ == "__main__":
