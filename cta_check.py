@@ -81,8 +81,9 @@ async def _check_page(ctx, url, label):
         await page.goto(url, wait_until="load", timeout=45000)
         await page.wait_for_timeout(2000)
         before = await page.evaluate(HIT_TEST_JS, CTA_SELECTOR)
-        # スクロール操作で WP Rocket の遅延スクリプトを起こしてから再確認
-        await page.mouse.wheel(0, 300)
+        # 操作を1回入れて WP Rocket の遅延スクリプトを起こしてから再確認。
+        # mouse.wheel はスマホ版 WebKit で使えないため、全エンジン共通のキー入力を使う
+        await page.keyboard.press("Shift")
         await page.wait_for_timeout(4000)
         await page.evaluate("window.scrollTo(0, 0)")
         after = await page.evaluate(HIT_TEST_JS, CTA_SELECTOR)
@@ -95,7 +96,7 @@ async def _check_page(ctx, url, label):
         b = bad[0]
         return f"登録ボタン「{b['text']}」が押せない(上に {b['blocker']} が重なっている, {len(bad)}箇所)"
     except Exception as e:
-        return f"ボタン確認でエラー ({type(e).__name__})"
+        return f"ボタン確認でエラー ({type(e).__name__}: {str(e).splitlines()[0][:100]})"
     finally:
         await page.close()
 
@@ -120,6 +121,9 @@ async def _check_device(pw, label, urls):
                 results[f"{url} | {label}(ボタン)"] = err
     finally:
         await browser.close()
+    # 全ページが確認エラーならサイトではなく監視ツール側の問題なので1件にまとめる
+    if urls and len(results) == len(urls) and all(v.startswith("ボタン確認でエラー") for v in results.values()):
+        return {f"監視ツールのエラー(サイトの異常ではありません) | {label}(ボタン)": next(iter(results.values()))}
     return results
 
 
