@@ -160,7 +160,7 @@ def fmt_failures(items):
     return "\n".join(lines)
 
 
-def run_once(dry_run):
+def run_once(dry_run, cta=True):
     """1回分のチェックと通知。Slack 送信に失敗したら False を返す。"""
     now = datetime.now(JST)
     urls, sitemap_errors = collect_urls()
@@ -171,7 +171,13 @@ def run_once(dry_run):
     failing_now = {f"{u} | {p}": e for u, p, e in results if e}
     for e in sitemap_errors:
         failing_now[f"{e} | -"] = "サイトマップ"
-    print(f"{now:%Y-%m-%d %H:%M} JST: {len(urls)}ページ x {len(PROFILES)}環境 = {len(jobs)}件チェック, 異常 {len(failing_now)}件")
+    summary = f"{len(urls)}ページ x {len(PROFILES)}環境 = {len(jobs)}件"
+    if cta:
+        from cta_check import check_ctas  # playwright が要るので必要なときだけ読み込む
+        cta_urls, cta_failures = check_ctas()
+        failing_now.update(cta_failures)
+        summary += f" + ボタン確認 {len(cta_urls)}ページ x 3環境"
+    print(f"{now:%Y-%m-%d %H:%M} JST: {summary}チェック, 異常 {len(failing_now)}件")
     for k, v in failing_now.items():
         print(f"  NG {k}: {v}")
 
@@ -192,6 +198,12 @@ def run_once(dry_run):
                     + "\n".join(f"• {k.rsplit(' | ', 1)[0]} [{k.rsplit(' | ', 1)[1]}]" for k in sorted(recovered)[:30]))
     if msgs:
         if new or remind_due:
+            if any("(ボタン)" in k for k in failing_now):
+                run = os.environ.get("GITHUB_RUN_ID")
+                where = (f"<{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run}|この実行>"
+                         if run else "screenshots/")
+                msgs.append(f"ボタンの画面写真は {where} の Artifacts に保存されます(監視の実行が終わった後に見られます)。"
+                            "原因調査のため、可能ならキャッシュクリアの前にClaudeに知らせてください。")
             msgs.append("キャッシュが原因なら、WP Rocket「キャッシュをクリア」で直ることが多いです。")
         try:
             post_slack("\n\n".join(msgs), dry_run)
@@ -217,13 +229,14 @@ def main():
     # interval 分ごとにチェックを繰り返し、合計 loop 分で終える(0なら1回だけ)
     ap.add_argument("--loop-minutes", type=float, default=0)
     ap.add_argument("--interval-minutes", type=float, default=60)
+    ap.add_argument("--no-cta", action="store_true", help="ブラウザでのボタン確認を省く")
     args = ap.parse_args()
 
     started = time.monotonic()
     ok = True
     while True:
         t0 = time.monotonic()
-        ok = run_once(args.dry_run) and ok
+        ok = run_once(args.dry_run, cta=not args.no_cta) and ok
         next_at = t0 + args.interval_minutes * 60
         if next_at + 10 * 60 > started + args.loop_minutes * 60:  # 次の1回を終える余裕がなければ終了
             break

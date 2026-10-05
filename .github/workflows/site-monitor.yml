@@ -7,6 +7,10 @@ on:
   schedule:
     - cron: "7 * * * *"
   workflow_dispatch:
+    inputs:
+      loop_minutes:
+        description: "繰り返す合計時間(分)。0で1回だけ"
+        default: "330"
 
 permissions:
   actions: read
@@ -33,7 +37,9 @@ jobs:
           python-version: "3.12"
           cache: pip
       - if: steps.guard.outputs.skip != 'true'
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium webkit
       # 前回の異常状態を引き継ぐ(新規検知・復旧・6時間ごとの再通知の判定用)
       - if: steps.guard.outputs.skip != 'true'
         uses: actions/cache/restore@v4
@@ -42,9 +48,17 @@ jobs:
           key: site-monitor-state-${{ github.run_id }}
           restore-keys: site-monitor-state-
       - if: steps.guard.outputs.skip != 'true'
-        run: python check_sites.py --loop-minutes 330 --interval-minutes 60
+        run: python check_sites.py --loop-minutes ${{ inputs.loop_minutes || 330 }} --interval-minutes 60
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # 登録ボタンが押せなかったときの画面写真
+      - if: always() && steps.guard.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cta-screenshots
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 30
       - if: always() && steps.guard.outputs.skip != 'true'
         uses: actions/cache/save@v4
         with:
