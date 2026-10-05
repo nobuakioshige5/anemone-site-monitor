@@ -2,7 +2,7 @@ name: site-monitor
 
 # GitHub の定期実行は混雑時に数時間に1回まで間引かれる(2026-10 実測で4〜6時間おき)。
 # そこで1回の実行の中で60分ごとにチェックを繰り返し(最大5.5時間)、
-# 毎時の起動は「前の実行がまだ動いていなければ引き継ぐ」役にする。
+# 終了時に次の実行を自分で起動してつなぎ、毎時の予定実行は鎖が切れたときの再開役にする。
 on:
   schedule:
     - cron: "7 * * * *"
@@ -11,9 +11,12 @@ on:
       loop_minutes:
         description: "繰り返す合計時間(分)。0で1回だけ"
         default: "330"
+      chained:
+        description: "前の実行が自分で起動した続きの実行か(手動では空のまま)"
+        default: ""
 
 permissions:
-  actions: read
+  actions: write
   contents: read
 
 jobs:
@@ -26,8 +29,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          n=$(gh run list -R "$GITHUB_REPOSITORY" --workflow site-monitor.yml --status in_progress --json databaseId -q "[.[] | select(.databaseId != ${GITHUB_RUN_ID})] | length")
-          echo "other in-progress runs: $n"
+          # 自分を起動した前の実行が後片付け中なので、終わるのを待ってから判定する
+          if [ "${{ inputs.chained }}" = "true" ]; then sleep 120; fi
+          n=$(gh run list -R "$GITHUB_REPOSITORY" --workflow site-monitor.yml --status in_progress --json databaseId -q "[.[] | select(.databaseId < ${GITHUB_RUN_ID})] | length")
+          # 自分より古い実行が動いていれば任せる(同時に起動しても古い方だけが残る)
+          echo "older in-progress runs: $n"
           if [ "$n" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
       - if: steps.guard.outputs.skip != 'true'
         uses: actions/checkout@v4
@@ -64,3 +70,8 @@ jobs:
         with:
           path: state
           key: site-monitor-state-${{ github.run_id }}
+      # 予定実行は数時間空くことがあるので、終わる前に次の実行を自分で起動して途切れないようにする
+      - if: always() && steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run site-monitor.yml -R "$GITHUB_REPOSITORY" --ref main -f chained=true -f loop_minutes=330
