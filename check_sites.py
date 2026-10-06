@@ -61,7 +61,7 @@ COMMON_HEADERS = {
 
 MIN_BYTES = 5000  # 展開後のHTMLがこれ未満なら壊れているとみなす(通常は4万バイト以上)
 TIMEOUT = 30
-WORKERS = 6
+WORKERS = 2  # 同時接続が多いとサーバーの自動遮断(DoS判定)に掛かるおそれがあるため控えめに
 RETRY_WAIT = 20
 REMIND_HOURS = 6
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "monitor_state.json")
