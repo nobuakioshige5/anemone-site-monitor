@@ -89,7 +89,9 @@ def collect_urls():
         try:
             walk(sm)
         except Exception as e:  # サイトマップ自体が壊れているのも異常として報告する
-            errors.append(f"サイトマップ取得失敗: {sm} ({type(e).__name__}: {e})")
+            # 詳細文にはオブジェクトのアドレス等が入り毎回変わるため、通知の照合キーには例外名だけを使う
+            errors.append(f"サイトマップ取得失敗: {sm} ({type(e).__name__})")
+            print(f"  サイトマップ取得失敗の詳細: {sm}: {e}")
     # 非HTMLと、プラグインが出す sitemap.html(本文が無い補助ページ)は除外
     urls = [u for u in dict.fromkeys(EXTRA_URLS + urls)
             if not re.search(r"(\.(xml|txt|pdf|jpe?g|png|gif|webp)|/sitemap\.html)$", u)]
