@@ -24,6 +24,7 @@ import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import requests
 
@@ -66,6 +67,11 @@ RETRY_WAIT = 20
 REMIND_HOURS = 6
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "monitor_state.json")
 JST = timezone(timedelta(hours=9))
+# GitHub の実行サーバー(IPは実行ごとに変わる)だけが Xserver に接続できなくなることがある
+# (10/4, 10/6-7 に発生。同じ実行の間はずっと繋がらず、次の実行で直る)。
+# 接続エラーが出たら外部の確認サービスでも見て、外からは正常なら「監視側だけの問題」として分けて通知する。
+CHECK_HOST_NODES = ["jp1.node.check-host.net", "hk1.node.check-host.net", "sg1.node.check-host.net"]
+BLOCKED_PROFILE = "監視側"
 
 
 def collect_urls():
@@ -125,6 +131,63 @@ def check(url, profile):
     return url, profile, err
 
 
+def is_connect_error(err):
+    return err.startswith("接続エラー") or "(ConnectTimeout)" in err or "(ConnectionError)" in err
+
+
+def reachable_from_outside(url):
+    """check-host.net の東京/香港/シンガポール拠点から取得し、どこかで200なら True。
+    確認サービス自体が使えないときは None(判断できないので通常の異常として扱う)。"""
+    try:
+        h = {"Accept": "application/json"}
+        r = requests.get("https://check-host.net/check-http", headers=h, timeout=TIMEOUT,
+                         params=[("host", url)] + [("node", n) for n in CHECK_HOST_NODES])
+        r.raise_for_status()
+        rid = r.json()["request_id"]
+        for _ in range(6):
+            time.sleep(5)
+            res = requests.get(f"https://check-host.net/check-result/{rid}", headers=h, timeout=TIMEOUT).json()
+            done = [v for v in res.values() if v is not None]
+            # 結果は [[成否, 秒, "OK", "200", IP]] の形
+            if any(v and v[0] and v[0][0] == 1 and str(v[0][3]) == "200" for v in done):
+                return True
+            if len(done) == len(res):
+                return False
+        return False
+    except Exception as e:
+        print(f"  外部確認(check-host.net)失敗: {type(e).__name__}: {e}")
+        return None
+
+
+def split_runner_blocked(failing_now):
+    """外部からは正常に見えるホストへの接続エラー(とその巻き添えのボタン確認エラー)を、
+    ホストごとに1件の「監視側」項目へまとめ直す。"""
+    hosts = set()
+    for key, err in failing_now.items():
+        if is_connect_error(key if err == "サイトマップ" else err):
+            hosts.add(urlparse(re.search(r"https://\S+", key).group(0)).hostname)
+    blocked = set()
+    for host in sorted(hosts):
+        ok = reachable_from_outside(f"https://{host}/")
+        print(f"  外部からの確認 {host}: {ok}")
+        if ok:
+            blocked.add(host)
+    if not blocked:
+        return failing_now
+    out = {}
+    for key, err in failing_now.items():
+        m = re.search(r"https://\S+", key)
+        host = urlparse(m.group(0)).hostname if m else None
+        if host in blocked and (is_connect_error(key if err == "サイトマップ" else err) or "ボタン確認でエラー" in err):
+            continue
+        if key.startswith("監視ツールのエラー"):  # ボタン確認の全滅も同じ原因
+            continue
+        out[key] = err
+    for host in sorted(blocked):
+        out[f"監視サーバーから {host} に接続できない | {BLOCKED_PROFILE}"] = "外部(東京など)からは正常に表示できています"
+    return out
+
+
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -179,6 +242,7 @@ def run_once(dry_run, cta=True):
         cta_urls, cta_failures = check_ctas()
         failing_now.update(cta_failures)
         summary += f" + ボタン確認 {len(cta_urls)}ページ x 3環境"
+    failing_now = split_runner_blocked(failing_now)
     print(f"{now:%Y-%m-%d %H:%M} JST: {summary}チェック, 異常 {len(failing_now)}件")
     for k, v in failing_now.items():
         print(f"  NG {k}: {v}")
@@ -190,16 +254,28 @@ def run_once(dry_run, cta=True):
     last = state.get("last_notified")
     remind_due = failing_now and (not last or now - datetime.fromisoformat(last) >= timedelta(hours=REMIND_HOURS))
 
+    def site_only(d):
+        return {k: v for k, v in d.items() if not k.endswith(f" | {BLOCKED_PROFILE}")}
+
     msgs = []
-    if new:
-        msgs.append(f":rotating_light: *サイト異常を検知* ({now:%m/%d %H:%M})\n{fmt_failures(new.items())}")
-    elif remind_due:
-        msgs.append(f":warning: *サイト異常が継続中* ({len(failing_now)}件, {now:%m/%d %H:%M})\n{fmt_failures(failing_now.items())}")
+    new_site = site_only(new)
+    new_blocked = {k: v for k, v in new.items() if k not in new_site}
+    if new_site:
+        msgs.append(f":rotating_light: *サイト異常を検知* ({now:%m/%d %H:%M})\n{fmt_failures(new_site.items())}")
+    elif remind_due and site_only(failing_now):
+        msgs.append(f":warning: *サイト異常が継続中* ({len(site_only(failing_now))}件, {now:%m/%d %H:%M})\n"
+                    f"{fmt_failures(site_only(failing_now).items())}")
+    if new_blocked:  # 監視側だけの問題は初回のみ知らせ、継続中の再通知はしない
+        msgs.append(f":large_yellow_circle: *監視サーバーだけがサイトに接続できません(サイトは正常)* ({now:%m/%d %H:%M})\n"
+                    + "\n".join(f"• {k.rsplit(' | ', 1)[0]}: {v}" for k, v in sorted(new_blocked.items()))
+                    + "\nGitHub の監視サーバーが Xserver 側で弾かれているとみられます。対応は不要です"
+                    "(次の監視サーバーに替わると通常は直ります)。この間、該当サイトの監視は止まっています。")
     if recovered:
         msgs.append(f":white_check_mark: *復旧しました* ({len(recovered)}件)\n"
                     + "\n".join(f"• {k.rsplit(' | ', 1)[0]} [{k.rsplit(' | ', 1)[1]}]" for k in sorted(recovered)[:30]))
+    alert = new_site or (remind_due and site_only(failing_now))
     if msgs:
-        if new or remind_due:
+        if alert:
             if any("(ボタン)" in k for k in failing_now):
                 run = os.environ.get("GITHUB_RUN_ID")
                 where = (f"<{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run}|この実行>"
@@ -212,9 +288,9 @@ def run_once(dry_run, cta=True):
         except Exception as e:  # 送れなかった異常は次回「新規」として再送されるよう状態を更新しない
             print(f"Slack送信失敗: {type(e).__name__}: {e}")
             return False
-        if new or remind_due:
+        if alert:
             state["last_notified"] = now.isoformat()
-    if not failing_now:
+    if not site_only(failing_now):
         state["last_notified"] = None
     state["failing"] = failing_now
     state["last_run"] = now.isoformat()
